@@ -75,6 +75,29 @@ describe('gitcode source', () => {
     expect(h.receive.mock.calls[0]![0]).toMatchObject({ source: 'gitcode', threads: [{ source: 'gitcode', id: 'issue:1' }], actor: { id: 'alice' }, addressed: 'mention' })
     expect(h.store.get(KV.gitcode.since)).toBeTruthy()
   })
+  it('ignores the agent\'s own comments when polling a subscribed Thread, including nested discussion replies', async () => {
+    const h = host()
+    h.store.saveSettings(h.store.settings())
+    // A Thread whose cursor is behind every comment below, so each one is considered this round.
+    h.store.threads.save({ key: 'gitcode:issue:3', ref: { source: 'gitcode', id: 'issue:3' }, createdAt: '2026-11-02T00:00:00.000Z',
+      lastAt: new Date().toISOString(), subscriptions: ['t1'], correlated: [], pending: [], meta: {} })
+    // `pollRound` reads Threads through `commands.withSignal`, which clones the instance, so spy on the prototype.
+    const run = vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+      const path = args.join(' ')
+      if (path.includes('/notifications?')) return JSON.stringify({ total: 0, list: [] })
+      if (path.includes('/issues/3/comments')) return JSON.stringify([
+        { id: 1, body: 'please look', user: { login: 'alice' }, created_at: '2026-11-03T10:00:00+08:00' },
+        { id: 2, body: 'On it: looking', user: { login: 'agent-bot' }, created_at: '2026-11-03T10:01:00+08:00',
+          reply: [{ id: 3, body: 'done', user: { login: 'agent-bot' }, created_at: '2026-11-03T10:02:00+08:00' }] },
+        { id: 4, body: 'thanks', user: { login: 'alice' }, created_at: '2026-11-03T10:03:00+08:00' },
+      ])
+      throw new Error(`unexpected ${path}`)
+    })
+    await pollRound(h.ctx)
+    expect(h.receive.mock.calls.map(call => (call[0] as Trigger).text)).toEqual(['please look', 'thanks'])
+    // Restore the prototype so a later test's instance spy is not shadowed by this one.
+    run.mockRestore()
+  })
   it('reads a merge request into the generic shape and parses the ticket threads', async () => {
     const h = host()
     vi.spyOn(h.commands, 'gitcodeApi').mockResolvedValue({ number: 1, state: 'merged', merged: null, merged_at: '2026-11-03T10:00:00+08:00',

@@ -28,6 +28,12 @@ const ConfigSchema = GitcodeAccountsSchema.extend({
 }).strict()
 export type GitcodeConfig = z.infer<typeof ConfigSchema>
 
+/**
+ * True when the agent account wrote the comment. Its own text must never become a Trigger: GitCode reports the agent's
+ * replies back like any other comment, so reading a Thread without this guard turns every answer into a new message.
+ */
+const ownComment = (comment: { user: { login: string } }, login: string): boolean => sameName(comment.user.login, login)
+
 /** Find a comment by id in a list that nests discussion replies under their root. */
 function findComment(comments: GitcodeComment[], id: string): GitcodeComment | undefined {
   for (const comment of comments) {
@@ -151,10 +157,10 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
     if (signal?.aborted) return
     const ref = notificationRef(notification, '')
     if (!ref) continue
-    if (notification.actor?.login && ctx.deployment.forge === 'gitcode' && notification.actor.login === ctx.deployment.gitcode.login) continue
+    if (notification.actor?.login && ctx.deployment.forge === 'gitcode' && sameName(notification.actor.login, ctx.deployment.gitcode.login)) continue
     const comments = await commands.gitcodePages(CommentSchema, `${ref.kind === 'issue' ? 'issues' : 'pulls'}/${ref.number}/comments`)
     const comment = findComment(comments, ref.commentId)
-    if (!comment) continue
+    if (!comment || ownComment(comment, accountOf(ctx).login)) continue
     const trigger = ref.kind === 'issue'
       ? commentTrigger(comment, { kind: 'issue', number: ref.number, url: ref.url, discussion: ref.discussionId }, accountOf(ctx).login)
       : commentTrigger(comment, { kind: 'pull', number: ref.number, url: ref.url, discussion: ref.discussionId }, accountOf(ctx).login)
@@ -225,11 +231,13 @@ async function pollObserved(ctx: SourceContext, signal: AbortSignal, started: st
         const comments = await ctx.commands.withSignal(signal).gitcodePages(CommentSchema, `pulls/${pull.data.number}/comments`)
         for (const comment of comments) {
           if (Date.parse(comment.updated_at ?? comment.created_at ?? '') < Date.parse(since)) continue
-          const trigger = commentTrigger(comment, { kind: 'pull', number: pull.data.number, url: pull.data.html_url ?? undefined }, account.login)
-          if (trigger) await ctx.receive(trigger)
+          if (!ownComment(comment, account.login)) {
+            const trigger = commentTrigger(comment, { kind: 'pull', number: pull.data.number, url: pull.data.html_url ?? undefined }, account.login)
+            if (trigger) await ctx.receive(trigger)
+          }
           for (const reply of comment.reply ?? []) {
             const parsed = CommentSchema.safeParse(reply)
-            if (!parsed.success) continue
+            if (!parsed.success || ownComment(parsed.data, account.login)) continue
             const replyTrigger = commentTrigger(parsed.data, { kind: 'pull', number: pull.data.number, url: pull.data.html_url ?? undefined }, account.login)
             if (replyTrigger) await ctx.receive(replyTrigger)
           }
@@ -335,14 +343,16 @@ async function pollSubscribed(ctx: SourceContext, signal: AbortSignal): Promise<
     for (const comment of comments) {
       const at = comment.updated_at ?? comment.created_at ?? ''
       if (Date.parse(at) < Date.parse(since) - 5000) continue
-      const trigger = commentTrigger(comment, { kind, number, url }, account.login)
-      if (trigger) {
-        await ctx.receive(trigger)
-        ctx.threads.describe(`${SOURCE}:${gitcodeThread(kind, number)}`, { label: detailLabel(kind, number, comment), url })
+      if (!ownComment(comment, account.login)) {
+        const trigger = commentTrigger(comment, { kind, number, url }, account.login)
+        if (trigger) {
+          await ctx.receive(trigger)
+          ctx.threads.describe(`${SOURCE}:${gitcodeThread(kind, number)}`, { label: detailLabel(kind, number, comment), url })
+        }
       }
       for (const reply of comment.reply ?? []) {
         const parsed = CommentSchema.safeParse(reply)
-        if (!parsed.success) continue
+        if (!parsed.success || ownComment(parsed.data, account.login)) continue
         const replyTrigger = commentTrigger(parsed.data, { kind, number, url }, account.login)
         if (replyTrigger) await ctx.receive(replyTrigger)
       }
