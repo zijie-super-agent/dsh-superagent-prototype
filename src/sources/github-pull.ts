@@ -4,6 +4,7 @@ import { key, liveTicket, type Follow, type OutboundMessage, type ThreadFact, ty
 import type { Deployment, GithubDeployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
+import type { PullBinding, PullInfo } from './kind.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
 
 const PullSchema = z.looseObject({
@@ -13,12 +14,18 @@ const PullSchema = z.looseObject({
   head: z.looseObject({ sha: z.string(), ref: z.string(), repo: z.looseObject({ full_name: z.string() }).nullish() }),
 })
 export type Pull = z.infer<typeof PullSchema> & { number: number }
-export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
-  ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
+const readPullByCommands = async (commands: SourceContext['commands'], number: number, signal?: AbortSignal): Promise<Pull> =>
+  ({ ...await commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
+export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> => readPullByCommands(ctx.commands, number, signal)
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
+const anyPullNumber = (thread: string): number | undefined => /^(?:github|gitcode:pull):(\d+)$/.exec(thread)?.[1] ? Number(/^(?:github|gitcode:pull):(\d+)$/.exec(thread)![1]) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])
-export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => pullsOf(ticket, true).at(-1) ?? pullsOf(ticket).at(-1)
+export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => {
+  const follows = ticket.follows ?? []
+  const open = follows.filter(item => !item.closed).flatMap(item => anyPullNumber(item.thread) ?? [])
+  return open.at(-1) ?? follows.flatMap(item => anyPullNumber(item.thread) ?? []).at(-1)
+}
 /** Narrow a deployment to GitHub; PR binding is a GitHub Source behavior. */
 const githubDeployment = (deployment: Deployment): GithubDeployment => {
   if (deployment.forge !== 'github') throw new Error('The GitHub Source requires the GitHub forge')
@@ -87,6 +94,19 @@ function closePull(ctx: SourceContext, pr: Pull): void {
   const at = pr.merged_at ?? pr.closed_at ?? new Date().toISOString()
   ctx.tickets.threadClosed({ source: SOURCE, id: String(pr.number) }, pr.merged ? 'merged' : 'closed', at)
 }
+/** The GitHub adapter of the generic pull request binding. */
+export const githubPull: PullBinding = {
+  read: async (commands, number, signal) => toPullInfo(await readPullByCommands(commands, number, signal)),
+  claim: (ctx, ticketId, pull) => claimPull(ctx, ticketId, toPull(pull)),
+  observe: (ctx, pull) => observePull(ctx, toPull(pull)),
+  numbers: (ticket, open) => pullsOf(ticket, open),
+  notice: (ticket, request, deployment) => deployment.forge === 'github' ? pullEndNotices(ticket, request, deployment.repository) : [],
+}
+const toPullInfo = (pr: Pull): PullInfo => ({ number: pr.number, state: pr.state, merged: pr.merged, mergedAt: pr.merged_at, closedAt: pr.closed_at,
+  title: pr.title, url: pr.html_url, autoMerge: pr.auto_merge, user: pr.user, head: pr.head })
+const toPull = (info: PullInfo): Pull => ({ ...info, html_url: info.url ?? '', merged: info.merged ?? undefined, merged_at: info.mergedAt ?? null,
+  closed_at: info.closedAt ?? null, head: { sha: info.head.sha ?? '', ref: info.head.ref, repo: info.head.repo ?? null } } as Pull)
+
 /**
  * Builds idempotent outbound notices for IM conversations when a ticket ends with its PR (selecting the last-closed PR it
  * opened, else the last one it followed). The notice language follows the ticket's source request: Chinese when it contains

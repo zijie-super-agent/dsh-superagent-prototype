@@ -13,6 +13,7 @@ import { KV } from '../src/kv.ts'
 import { sendGitcode } from '../src/sources/gitcode-channel.ts'
 import { commentTrigger, notificationRef, gitcodeThread, gitcodePage } from '../src/sources/gitcode-trigger.ts'
 import { gitcodeKind, pollRound } from '../src/sources/gitcode.ts'
+import { gitcodePull, pullEndNotices, pullOf, pullsOf } from '../src/sources/gitcode-pull.ts'
 import { testGitcodeDeployment } from './fixtures/deployment.ts'
 
 let dir = ''
@@ -73,6 +74,25 @@ describe('gitcode source', () => {
     expect(h.receive).toHaveBeenCalledTimes(1)
     expect(h.receive.mock.calls[0]![0]).toMatchObject({ source: 'gitcode', threads: [{ source: 'gitcode', id: 'issue:1' }], actor: { id: 'alice' }, addressed: 'mention' })
     expect(h.store.get(KV.gitcode.since)).toBeTruthy()
+  })
+  it('reads a merge request into the generic shape and parses the ticket threads', async () => {
+    const h = host()
+    vi.spyOn(h.commands, 'gitcodeApi').mockResolvedValue({ number: 1, state: 'merged', merged: null, merged_at: '2026-11-03T10:00:00+08:00',
+      html_url: 'https://gitcode.com/acme/widgets/merge_requests/1', user: { login: 'alice' }, head: { ref: 'fix', sha: 'abc', repo: { full_name: 'acme/widgets' } } })
+    expect(await gitcodePull.read(h.commands, 1)).toMatchObject({ number: 1, state: 'merged', mergedAt: '2026-11-03T10:00:00+08:00',
+      url: 'https://gitcode.com/acme/widgets/merge_requests/1', head: { ref: 'fix' } })
+    expect(pullsOf({ follows: [{ thread: 'gitcode:pull:1', own: true }] })).toEqual([1])
+    expect(pullOf({ follows: [{ thread: 'gitcode:pull:1', own: true }] })).toBe(1)
+  })
+  it('closes a ticket when its merge request merges and builds the terminal notice', async () => {
+    const h = host()
+    const closed = vi.fn()
+    const ctx = { ...h.ctx, tickets: { ...h.ctx.tickets, open: () => [{ id: 't1', follows: [{ thread: 'gitcode:pull:1', own: true }] }], threadClosed: closed } }
+    expect(await gitcodePull.observe(ctx as never, { number: 1, state: 'merged', mergedAt: '2026-11-03T10:00:00+08:00', user: { login: 'alice' }, head: { ref: 'fix' } }))
+      .toBe(true)
+    expect(closed).toHaveBeenCalledWith({ source: 'gitcode', id: 'pull:1' }, 'merged', '2026-11-03T10:00:00+08:00')
+    const ticket = { id: 't1', follows: [{ thread: 'gitcode:pull:1', own: true, closed: { at: '2026-11-03T10:00:00+08:00' } }], channels: [], ended: { outcome: 'merged' } } as never
+    expect(pullEndNotices(ticket, '修复', { repository: 'acme/widgets', gitcode: { host: 'gitcode.com' } })).toEqual([])
   })
   it('replies with an idempotent marker and recognizes an existing reply', async () => {
     const h = host()

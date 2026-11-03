@@ -5,13 +5,13 @@ import { GitcodeAccountsSchema } from '../deployment.ts'
 import { validItems } from '../infra/commands.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
-import { cursorAt, pause, POLL_HORIZON_MS } from './poll.ts'
+import { cursorAt, pause, pollThreads as pollEach } from './poll.ts'
 import { gitcodeLink, sendGitcode } from './gitcode-channel.ts'
-import { commentMessages, gitcodeThreadContext, readGitcode } from './gitcode-read.ts'
-import { commentTrigger, CommentSchema, gitcodeThread, IssueSchema, NotificationPageSchema, notificationRef, PullSchema,
+import { gitcodePull } from './gitcode-pull.ts'
+import { gitcodeThreadContext } from './gitcode-read.ts'
+import { commentTrigger, CommentSchema, gitcodePage, gitcodeThread, NotificationPageSchema, notificationRef,
   SOURCE, type GitcodeComment, type GitcodeKind } from './gitcode-trigger.ts'
 import type { Localized, SourceKind } from './kind.ts'
-import type { Trigger } from '../core/index.ts'
 
 const ConfigSchema = GitcodeAccountsSchema.extend({
   pollSeconds: z.number().int().min(60).max(3600).default(60),
@@ -47,6 +47,7 @@ export const gitcodeKind: SourceKind<GitcodeConfig> = {
   ],
   health: ['gitcode'],
   scope: () => ({ listened: true, observed: false, row: 'comments' }),
+  pull: gitcodePull,
   channel: { send: sendGitcode, link: gitcodeLink },
   threadContext: gitcodeThreadContext,
   // `#12` names an Issue and a PR, which GitCode numbers separately; `!12` prefers the PR.
@@ -133,12 +134,49 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
     if (Date.parse(notification.update_at) > Date.parse(newest)) newest = notification.update_at
   }
   ctx.state.set(KV.gitcode.since, cursorAt(newest))
-  ctx.report('gitcode', { state: 'ready', detail: `${page.list.length} mention notifications; next poll ≥ 60s`, at: started })
+  await pollSubscribed(ctx, signal ?? new AbortController().signal)
+  ctx.report('gitcode', { state: 'ready', detail: `${page.list.length} mention notifications; subscribed Threads polled`, at: started })
 }
 
 function accountOf(ctx: SourceContext): { login: string } {
   if (ctx.deployment.forge !== 'gitcode') throw new Error('The GitCode Source requires the GitCode forge')
   return ctx.deployment.gitcode
+}
+
+/** Polls subscribed Threads for comments that do not mention the agent; a reply is nested in its root comment's `reply`. */
+async function pollSubscribed(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+  const account = accountOf(ctx)
+  await pollEach(ctx, SOURCE, () => signal.aborted, async thread => {
+    const [kindText, numberText] = thread.ref.id.split(':')
+    const kind: GitcodeKind = kindText === 'pull' ? 'pull' : 'issue'
+    const number = Number(numberText)
+    if (!Number.isInteger(number) || number <= 0) throw new Error(`Unreadable GitCode thread id: ${thread.ref.id}`)
+    const commands = ctx.commands.withSignal(signal)
+    const path = `${kind === 'pull' ? 'pulls' : 'issues'}/${number}/comments`
+    const since = ctx.state.get(KV.gitcode.cursor(thread.key)) ?? thread.createdAt
+    const comments = await commands.gitcodePages(CommentSchema, path)
+    const url = gitcodePage(ctx.deployment.repository, kind, number, ctx.deployment.forge === 'gitcode' ? ctx.deployment.gitcode.host : 'gitcode.com')
+    for (const comment of comments) {
+      const at = comment.updated_at ?? comment.created_at ?? ''
+      if (Date.parse(at) < Date.parse(since) - 5000) continue
+      const trigger = commentTrigger(comment, { kind, number, url }, account.login)
+      if (trigger) {
+        await ctx.receive(trigger)
+        ctx.threads.describe(`${SOURCE}:${gitcodeThread(kind, number)}`, { label: detailLabel(kind, number, comment), url })
+      }
+      for (const reply of comment.reply ?? []) {
+        const parsed = CommentSchema.safeParse(reply)
+        if (!parsed.success) continue
+        const replyTrigger = commentTrigger(parsed.data, { kind, number, url }, account.login)
+        if (replyTrigger) await ctx.receive(replyTrigger)
+      }
+    }
+    ctx.state.set(KV.gitcode.cursor(thread.key), cursorAt(new Date().toISOString()))
+  })
+}
+
+function detailLabel(kind: GitcodeKind, number: number, comment: GitcodeComment): string {
+  return kind === 'pull' ? `!${number}` : `Issue #${number}${comment.body ? '' : ''}`
 }
 
 async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {

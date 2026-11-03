@@ -371,6 +371,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/gitcode-trigger.ts` | GitCode Issues, merge requests, comments and notifications as Triggers, and their Thread and Channel addresses |
 | `src/sources/gitcode-channel.ts` | The GitCode Channel: Issue comments, PR comments and discussion replies, `sent` or `gone` |
 | `src/sources/gitcode-read.ts` | The `gitcode/` resources and `gitcodeThreadContext`: an Issue's or merge request's conversation by page |
+| `src/sources/gitcode-pull.ts` | The GitCode merge request rules: `claimPull`, `observePull`, the closes it reports, `gitcodePull`, and `pullEndNotices` |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
