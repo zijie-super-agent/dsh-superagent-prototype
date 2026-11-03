@@ -1,7 +1,7 @@
 /** Pull request binding, lifecycle observation, and terminal IM notification helpers. */
 import { z } from 'zod'
 import { key, liveTicket, type Follow, type OutboundMessage, type ThreadFact, type Ticket } from '../core/index.ts'
-import type { Deployment } from '../deployment.ts'
+import type { Deployment, GithubDeployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
@@ -19,9 +19,14 @@ const pullNumber = (thread: string): number | undefined => thread.startsWith(`${
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])
 export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => pullsOf(ticket, true).at(-1) ?? pullsOf(ticket).at(-1)
+/** Narrow a deployment to GitHub; PR binding is a GitHub Source behavior. */
+const githubDeployment = (deployment: Deployment): GithubDeployment => {
+  if (deployment.forge !== 'github') throw new Error('The GitHub Source requires the GitHub forge')
+  return deployment
+}
 /** True when the PR was opened by the agent account from a branch in the configured repository (not a fork). */
 export const agentPull = (pr: { user: { login: string }; head?: { repo?: { full_name: string } | null } | null },
-  deployment: Pick<Deployment, 'github' | 'repository'>): boolean =>
+  deployment: Pick<GithubDeployment, 'github' | 'repository'>): boolean =>
   sameName(pr.user.login, deployment.github.login) && sameName(pr.head?.repo?.full_name ?? '', deployment.repository)
 /** True when a branch belongs to the ticket: its last path segment is the ticket's short name, such as `agent/<name>`. */
 export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): boolean =>
@@ -37,9 +42,9 @@ export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): strin
   if (!ticket || !liveTicket(ticket)) return 'Ticket ended because its PR was closed'
   const source = ctx.triggers.get(ticket.origin.triggerId)
   const started = source?.source === SOURCE && source.meta.isPr === true && source.meta.number === pr.number
-  const opened = agentPull(pr, ctx.deployment) && ticketBranch(ticket, pr.head.ref)
+  const opened = agentPull(pr, githubDeployment(ctx.deployment)) && ticketBranch(ticket, pr.head.ref)
   if (!started && !opened) {
-    const { login } = ctx.deployment.github
+    const { login } = githubDeployment(ctx.deployment).github
     return `PR does not belong to this ticket: use the source PR or a PR by ${login} from a branch whose last path segment is DSH_SUPERAGENT_NAME; omit pr_number when no PR exists`
   }
   const owner = ctx.tickets.open().find(item => pullsOf(item, true).includes(pr.number))
@@ -58,7 +63,7 @@ export async function observePull(ctx: SourceContext, pr: Pull): Promise<boolean
   const ended = pr.state === 'closed' || !!pr.merged
   if (ended) closePull(ctx, pr)
   else {
-    const candidates = agentPull(pr, ctx.deployment) ? ctx.tickets.open().filter(ticket => ticketBranch(ticket, pr.head.ref)) : []
+    const candidates = agentPull(pr, githubDeployment(ctx.deployment)) ? ctx.tickets.open().filter(ticket => ticketBranch(ticket, pr.head.ref)) : []
     const ticket = candidates.length === 1 ? candidates[0]! : undefined
     // A PR the ticket followed until it closed, and that is open again, is followed again.
     const reopened = ticket?.follows?.some(item => item.thread === `${SOURCE}:${pr.number}` && item.closed)

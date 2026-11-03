@@ -72,8 +72,20 @@ export class Commands {
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
+  private githubCli(): string {
+    const deployment = this.deployment
+    if (deployment.forge !== 'github') throw new Error('The deployment is not the GitHub forge')
+    return deployment.github.cli
+  }
+  private gitcodeCli(): string {
+    const deployment = this.deployment
+    if (deployment.forge !== 'gitcode') throw new Error('The deployment is not the GitCode forge')
+    return deployment.gitcode.cli
+  }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.githubCli(), args)) as T }
+  /** Runs the agent's GitCode CLI and parses its JSON output; callers should prefer `gitcodeApi`, which is restricted to the configured repository. */
+  async gc<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.gitcodeCli(), ['--no-interactive', '--no-update-check', ...args])) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +94,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.githubCli(), ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -91,9 +103,33 @@ export class Commands {
     const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.path(path), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
   }
+  /** Calls the GitCode API on a path within the configured repository (v5, or an explicit /api/v8 path). */
+  async gitcodeApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T> {
+    return schema.parse(await this.gc(['api', this.gitcodePath(path), ...flags]))
+  }
+  /** Fetches all pages of a GitCode API list; `gc api` has no --paginate, so pages are requested one by one. */
+  async gitcodePages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const all: unknown[] = []
+    for (let page = 1; page <= 20; page++) {
+      const separator = path.includes('?') ? '&' : '?'
+      const listed = z.array(z.unknown()).parse(await this.gc(['api', this.gitcodePath(`${path}${separator}per_page=100&page=${page}`)]))
+      all.push(...listed)
+      if (listed.length < 100) break
+    }
+    return validItems(item, all, tally)
+  }
   private path(path: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
     if (outside) throw new Error('GitHub calls are restricted to the configured repository')
+    return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  private gitcodePath(path: string): string {
+    if (path.startsWith('/api/')) {
+      if (!path.startsWith(`/api/v8/repos/${this.repository}/`)) throw new Error('GitCode calls are restricted to the configured repository')
+      return path
+    }
+    const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
+    if (outside) throw new Error('GitCode calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
   }
   /**
