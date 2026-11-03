@@ -49,7 +49,10 @@ export const KV = {
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
   /** GitCode Source: the last notification cursor (update time) read. */
-  gitcode: { since: record<string>('gitcode-since'), cursor: family<string, [thread: string]>('gitcode-cursor:') },
+  gitcode: { since: record<string>('gitcode-since'), cursor: family<string, [thread: string]>('gitcode-cursor:'),
+    stream: family<{ since: string; started: Record<string, string> }, [stream: string]>('gitcode-stream:'),
+    ci: family<{ fingerprint: string; revision: number }, [number: number]>('gitcode-ci:'),
+    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('gitcode-branch-ci') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.

@@ -3,19 +3,28 @@ import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { GitcodeAccountsSchema } from '../deployment.ts'
 import { validItems } from '../infra/commands.ts'
+import { sameName } from '../infra/text.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, pause, pollThreads as pollEach } from './poll.ts'
 import { gitcodeLink, sendGitcode } from './gitcode-channel.ts'
 import { gitcodePull } from './gitcode-pull.ts'
 import { gitcodeThreadContext } from './gitcode-read.ts'
-import { commentTrigger, CommentSchema, gitcodePage, gitcodeThread, NotificationPageSchema, notificationRef,
-  SOURCE, type GitcodeComment, type GitcodeKind } from './gitcode-trigger.ts'
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, gitcodePage, gitcodeThread, IssueSchema, ListedCommentSchema,
+  NotificationPageSchema, notificationRef, pullTrigger, issueTrigger, PullSchema, SOURCE, type GitcodeComment, type GitcodeKind } from './gitcode-trigger.ts'
+import { pullsOf } from './gitcode-pull.ts'
 import type { Localized, SourceKind } from './kind.ts'
+import type { ThreadFact } from '../core/index.ts'
 
+const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
+type Scope = keyof typeof OBSERVED
 const ConfigSchema = GitcodeAccountsSchema.extend({
   pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
+  observeIssues: z.boolean().default(false),
+  observePulls: z.boolean().default(false),
+  observeComments: z.boolean().default(false),
+  observeCi: z.boolean().default(false),
 }).strict()
 export type GitcodeConfig = z.infer<typeof ConfigSchema>
 
@@ -44,9 +53,22 @@ export const gitcodeKind: SourceKind<GitcodeConfig> = {
       hint: { zh: 'gitcode.com 或 atomgit.com；API、网页链接和 gc 都按它选择。', en: 'gitcode.com or atomgit.com; API, web links and gc follow it.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 60, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
     { key: 'failuresBeforeError', type: 'number', advanced: true, min: 1, max: 20, label: { zh: '连续失败几次后报告异常', en: 'Failed polls before reporting an error' } },
+    { key: 'observeIssues', type: 'switch', label: { zh: '接收仓库里的新 Issue', en: 'Receive new Issues in the repository' },
+      hint: { zh: '打开后，没有 @ 智能体的新 Issue 也会收到，由策略的接收表决定是否成为候选。从打开的时候开始，不读以前的。', en: 'New Issues that do not mention the agent are received too, and the Policy admission table decides whether they become candidates. Starts when switched on; earlier ones are not read.' } },
+    { key: 'observePulls', type: 'switch', label: { zh: '接收仓库里的新 PR', en: 'Receive new merge requests in the repository' },
+      hint: { zh: '打开后，没有 @ 智能体的新 PR 也会收到，由策略的接收表决定是否成为候选。', en: 'New merge requests that do not mention the agent are received too, and the Policy admission table decides whether they become candidates.' } },
+    { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
+      hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments on Issues and merge requests that do not mention the agent are received too, and the Policy admission table decides whether they become candidates.' } },
+    { key: 'observeCi', type: 'switch', label: { zh: '接收 PR 和默认分支的 Actions', en: 'Receive Actions on PRs and the default branch' },
+      hint: { zh: '打开后，PR 和默认分支的 Actions run 失效/恢复会收到，由策略的接收表决定是否成为候选。只读已有 CI；不负责开启仓库的 Actions。', en: 'Failures and recoveries of PR and default-branch Actions runs are received, and the Policy admission table decides whether they become candidates. Reads existing CI only; does not enable Actions.' } },
   ],
   health: ['gitcode'],
-  scope: () => ({ listened: true, observed: false, row: 'comments' }),
+  scope({ meta }, config) {
+    const row: Scope | undefined = meta.ci === true ? 'ci'
+      : typeof meta.commentId === 'string' || typeof meta.commentId === 'number' ? 'comments'
+        : meta.kind === 'issue' ? 'issues' : meta.kind === 'pull' ? 'pulls' : undefined
+    return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
+  },
   pull: gitcodePull,
   channel: { send: sendGitcode, link: gitcodeLink },
   threadContext: gitcodeThreadContext,
@@ -71,8 +93,17 @@ export const gitcodeKind: SourceKind<GitcodeConfig> = {
         columns: [{ key: 'id', type: 'text', label: { zh: '账号', en: 'Account' }, pattern: '[A-Za-z0-9_.\\-]+' }] },
     ],
     explicit: { zh: '名单里的账号在 Issue 或评论里 @ 智能体的 GitCode 账号。', en: 'An account on the list mentions the agent\'s GitCode account in an Issue or a comment.' },
-    rows: () => [{ id: 'comments', label: { zh: '评论', en: 'Comments' }, note: { zh: '仅 @', en: '@ only' },
-      cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } }],
+    rows(stored) {
+      const config = ConfigSchema.partial().parse(stored)
+      const note = (observed: boolean | undefined) => observed ? { zh: '全部', en: 'All' } : { zh: '仅 @', en: '@ only' }
+      const row = (id: Scope, label: { zh: string; en: string }) => ({ id, label, note: note(config[OBSERVED[id]]),
+        cells: { listedUnaddressed: !!config[OBSERVED[id]], unlistedAddressed: true, unlistedUnaddressed: !!config[OBSERVED[id]] } })
+      return [row('issues', { zh: '新 Issue', en: 'New Issues' }), row('pulls', { zh: '新 PR', en: 'New merge requests' }),
+        row('comments', { zh: '评论', en: 'Comments' }),
+        { id: 'ci', label: { zh: 'PR 和默认分支的 Actions', en: 'Actions on PRs and the default branch' },
+          note: config.observeCi ? { zh: '接收', en: 'Received' } : { zh: '不接收', en: 'Not received' },
+          cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: !!config.observeCi } }]
+    },
   },
   environment: {
     variables: [
@@ -135,12 +166,157 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   }
   ctx.state.set(KV.gitcode.since, cursorAt(newest))
   await pollSubscribed(ctx, signal ?? new AbortController().signal)
-  ctx.report('gitcode', { state: 'ready', detail: `${page.list.length} mention notifications; subscribed Threads polled`, at: started })
+  await pollObserved(ctx, signal ?? new AbortController().signal, started)
+  await pollCi(ctx, signal ?? new AbortController().signal)
+  ctx.report('gitcode', { state: 'ready', detail: `${page.list.length} mention notifications; Threads, streams and Actions polled`, at: started })
 }
 
 function accountOf(ctx: SourceContext): { login: string } {
   if (ctx.deployment.forge !== 'gitcode') throw new Error('The GitCode Source requires the GitCode forge')
   return ctx.deployment.gitcode
+}
+
+/** Reads one repository-wide stream after its cursor and advances it; a first read starts at `started`, not at history. */
+async function readObserved(ctx: SourceContext, signal: AbortSignal, stream: Scope, path: string, started: string,
+  take: (value: unknown) => Promise<string | undefined>): Promise<void> {
+  const state = ctx.state
+  const name = KV.gitcode.stream(stream)
+  const stored = state.get(name)
+  const since = stored?.since ?? started
+  const startedAt = stored?.started?.[stream] ?? since
+  const listed = await ctx.commands.withSignal(signal).gitcodePages(z.unknown(), `${path}${path.includes('?') ? '&' : '?'}since=${encodeURIComponent(since)}`)
+  let newest = since
+  for (const item of listed) {
+    if (signal.aborted) return
+    const at = await take(item)
+    if (at && Date.parse(at) > Date.parse(newest)) newest = at
+  }
+  state.set(name, { since: newest === since ? since : cursorAt(new Date(newest).toISOString()), started: { ...stored?.started, [stream]: startedAt } })
+}
+
+async function pollObserved(ctx: SourceContext, signal: AbortSignal, started: string): Promise<void> {
+  const config = ctx.config<GitcodeConfig>(SOURCE)
+  if (!config) return
+  const account = accountOf(ctx)
+  if (config.observeIssues) {
+    await readObserved(ctx, signal, 'issues', 'issues?state=all&sort=updated&direction=asc', started, async item => {
+      const issue = IssueSchema.safeParse(item)
+      if (!issue.success || !issue.data.created_at || Date.parse(issue.data.created_at) < Date.parse(ctx.state.get(KV.gitcode.stream('issues'))?.since ?? started)) return undefined
+      if (sameName(issue.data.user.login, account.login)) return issue.data.updated_at ?? issue.data.created_at ?? undefined
+      await ctx.receive(issueTrigger(issue.data, account.login))
+      const number = Number(issue.data.number)
+      ctx.threads.describe(`${SOURCE}:${gitcodeThread('issue', number)}`, { label: `Issue #${number}`, ...(issue.data.html_url ? { url: issue.data.html_url } : {}) })
+      return issue.data.updated_at ?? issue.data.created_at ?? undefined
+    })
+  }
+  if (config.observePulls || config.observeComments) {
+    await readObserved(ctx, signal, 'pulls', 'pulls?state=all&sort=updated&direction=asc', started, async item => {
+      const pull = PullSchema.safeParse(item)
+      if (!pull.success) return undefined
+      const created = pull.data.created_at ?? ''
+      const stream = ctx.state.get(KV.gitcode.stream('pulls'))
+      const since = stream?.since ?? started
+      if (sameName(pull.data.user.login, account.login)) return pull.data.updated_at ?? created ?? undefined
+      if (config.observePulls && Date.parse(created) >= Date.parse(since)) {
+        await ctx.receive(pullTrigger(pull.data, account.login))
+        ctx.threads.describe(`${SOURCE}:${gitcodeThread('pull', pull.data.number)}`, { label: `!${pull.data.number}`, ...(pull.data.html_url ? { url: pull.data.html_url } : {}) })
+      }
+      if (config.observeComments) {
+        const comments = await ctx.commands.withSignal(signal).gitcodePages(CommentSchema, `pulls/${pull.data.number}/comments`)
+        for (const comment of comments) {
+          if (Date.parse(comment.updated_at ?? comment.created_at ?? '') < Date.parse(since)) continue
+          const trigger = commentTrigger(comment, { kind: 'pull', number: pull.data.number, url: pull.data.html_url ?? undefined }, account.login)
+          if (trigger) await ctx.receive(trigger)
+          for (const reply of comment.reply ?? []) {
+            const parsed = CommentSchema.safeParse(reply)
+            if (!parsed.success) continue
+            const replyTrigger = commentTrigger(parsed.data, { kind: 'pull', number: pull.data.number, url: pull.data.html_url ?? undefined }, account.login)
+            if (replyTrigger) await ctx.receive(replyTrigger)
+          }
+        }
+      }
+      return pull.data.updated_at ?? created ?? undefined
+    })
+  }
+  if (config.observeComments) {
+    await readObserved(ctx, signal, 'comments', 'issues/comments?sort=updated&direction=asc', started, async item => {
+      const comment = ListedCommentSchema.safeParse(item)
+      if (!comment.success) return undefined
+      const number = Number(comment.data.target?.issue?.number)
+      if (!Number.isInteger(number) || number <= 0) return comment.data.updated_at ?? comment.data.created_at ?? undefined
+      if (sameName(comment.data.user.login, account.login)) return comment.data.updated_at ?? comment.data.created_at ?? undefined
+      const trigger = commentTrigger(comment.data, { kind: 'issue', number, url: gitcodePage(ctx.deployment.repository, 'issue', number, gitcodeHost(ctx)) }, account.login)
+      if (trigger) {
+        await ctx.receive(trigger)
+        ctx.threads.describe(`${SOURCE}:${gitcodeThread('issue', number)}`, { label: `Issue #${number}`, url: gitcodePage(ctx.deployment.repository, 'issue', number, gitcodeHost(ctx)) })
+      }
+      return comment.data.updated_at ?? comment.data.created_at ?? undefined
+    })
+  }
+}
+
+function gitcodeHost(ctx: SourceContext): string {
+  return ctx.deployment.forge === 'gitcode' ? ctx.deployment.gitcode.host : 'gitcode.com'
+}
+
+const RunSchema = z.looseObject({ workflow_run_id: z.union([z.string(), z.number()]), workflow_name: z.string().default(''),
+  status: z.string().default(''), head_sha: z.string().optional(), pull_request_id: z.union([z.string(), z.number()]).optional() })
+const RunsPageSchema = z.looseObject({ workflow_runs: z.array(RunSchema).default([]) })
+const RepoInfoSchema = z.looseObject({ default_branch: z.string().optional() })
+type Run = z.infer<typeof RunSchema>
+const FAILED = new Set(['FAILED', 'CANCELED'])
+const RUNNING = new Set(['RUNNING', 'PAUSED', 'SUSPEND'])
+const counts = (runs: Run[]) => ({ failed: runs.filter(run => FAILED.has(run.status)).length, running: runs.filter(run => RUNNING.has(run.status)).length })
+const failures = (runs: Run[]): string[] => runs.filter(run => FAILED.has(run.status)).map(run => run.workflow_name).filter(Boolean).sort()
+function summary(runs: Run[], where: string): string {
+  const failed = failures(runs), running = runs.filter(run => RUNNING.has(run.status)).map(run => run.workflow_name).filter(Boolean)
+  const at = `on ${where}`
+  if (failed.length) return `CI failed ${failed.length}/${runs.length} ${at}: ${failed.slice(0, 5).join(', ')}${running.length ? `; ${running.length} still running` : ''}`
+  if (running.length) return `CI running ${running.length}/${runs.length} ${at}: ${running.slice(0, 5).join(', ')}`
+  return `CI passed ${runs.length}/${runs.length} ${at}`
+}
+const fact = (runs: Run[]): ThreadFact => {
+  const { failed, running } = counts(runs)
+  if (failed) return { label: { zh: 'CI 失败', en: 'CI failed' }, value: String(failed), problem: true }
+  if (running) return { label: { zh: 'CI 进行中', en: 'CI running' }, value: String(running) }
+  return { label: 'CI', value: { zh: '通过', en: 'passed' } }
+}
+
+/** Polls Actions runs for open-ticket PRs and the default branch; only changes after the first baseline become Triggers. */
+async function pollCi(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+  const config = ctx.config<GitcodeConfig>(SOURCE)
+  if (!config?.observeCi) return
+  const commands = ctx.commands.withSignal(signal)
+  const repository = ctx.deployment.repository
+  const host = gitcodeHost(ctx)
+  const numbers = [...new Set(ctx.tickets.open().flatMap(ticket => pullsOf(ticket, true)))]
+  for (const number of numbers) {
+    if (signal.aborted) return
+    const page = await commands.gitcodeApi(RunsPageSchema, `/api/v8/repos/${repository}/actions/runs?pull_request_id=${number}&per_page=100`)
+    const fingerprint = JSON.stringify(page.workflow_runs.map(run => [run.workflow_run_id, run.status]))
+    const previous = ctx.state.get(KV.gitcode.ci(number))
+    if (previous?.fingerprint === fingerprint) continue
+    const revision = previous ? previous.revision + 1 : 0
+    if (previous) await ctx.receive(ciTrigger({ number, html_url: gitcodePage(repository, 'pull', number, host), user: { login: '' } }, revision, summary(page.workflow_runs, `PR !${number}`)))
+    ctx.state.set(KV.gitcode.ci(number), { fingerprint, revision })
+    ctx.threads.describe(`${SOURCE}:${gitcodeThread('pull', number)}`, { facts: { ci: fact(page.workflow_runs) } })
+  }
+  const repo = await commands.gitcodeApi(RepoInfoSchema, '')
+  const branch = repo.default_branch ?? 'main'
+  const page = await commands.gitcodeApi(RunsPageSchema, `/api/v8/repos/${repository}/actions/runs?branch=${encodeURIComponent(branch)}&event=Push&per_page=100`)
+  const failed = failures(page.workflow_runs)
+  const previous = ctx.state.get(KV.gitcode.branchCi)
+  const known = previous?.branch === branch ? previous.failures : undefined
+  const now = failed.length || counts(page.workflow_runs).running ? failed : known ?? []
+  let revision = previous?.revision ?? 0
+  if (known && JSON.stringify(now) !== JSON.stringify(known)) {
+    revision += 1
+    const sha = page.workflow_runs[0]?.head_sha ?? ''
+    await ctx.receive(branchCiTrigger(branch, sha, revision, summary(page.workflow_runs, branch),
+      `https://${host}/${repository}/commit/${sha}`))
+    ctx.threads.describe(`${SOURCE}:ci:${branch}`, { label: `CI on ${branch}`, facts: { ci: fact(page.workflow_runs) } })
+  }
+  ctx.state.set(KV.gitcode.branchCi, { branch, failures: now, revision })
 }
 
 /** Polls subscribed Threads for comments that do not mention the agent; a reply is nested in its root comment's `reply`. */

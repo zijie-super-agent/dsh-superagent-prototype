@@ -32,6 +32,11 @@ export const CommentSchema = z.looseObject({
   diff_position: z.looseObject({ start_new_line: z.number().nullish(), end_new_line: z.number().nullish() }).nullish(),
 })
 export type GitcodeComment = z.infer<typeof CommentSchema>
+/** An Issue comment from the repository-wide `issues/comments` stream; `target.issue.number` names its Issue. */
+export const ListedCommentSchema = CommentSchema.extend({
+  target: z.looseObject({ issue: z.looseObject({ number: z.union([z.string(), z.number()]).optional(), title: z.string().optional() }).optional() }).optional(),
+})
+export type ListedComment = z.infer<typeof ListedCommentSchema>
 export const CommentPageSchema = z.array(z.unknown())
 /** A GitCode Issue; `number` is a string on some endpoints. */
 export const IssueSchema = z.looseObject({
@@ -109,4 +114,18 @@ export function pullTrigger(pull: GitcodePull, agent: string): Trigger {
     ...(mentions(body, agent) ? { addressed: 'mention' as const } : {}),
     channel: gitcodeChannel('pull', pull.number, pull.html_url ?? undefined), ...(pull.html_url ? { url: pull.html_url } : {}),
     meta: { kind: 'pull', number: pull.number, prAuthor: pull.user.login } }
+}
+
+
+/** Builds a Trigger for a PR's Actions run change; CI has no person, so it has no explicit mention. */
+export function ciTrigger(pull: { number: number; html_url?: string | null; user: { login: string } }, revision: number, summary: string): Trigger {
+  return { id: key('gitcode-ci', String(pull.number), String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: gitcodeThread('pull', pull.number) }],
+    actor: { source: SOURCE, id: '' }, human: false, at: new Date().toISOString(), text: summary,
+    channel: gitcodeChannel('pull', pull.number, pull.html_url ?? undefined), ...(pull.html_url ? { url: pull.html_url } : {}),
+    meta: { kind: 'pull', number: pull.number, prAuthor: pull.user.login, ci: true, revision } }
+}
+/** Builds a Trigger for a default-branch Actions run change; it has no person to reply to, so it has no channel. */
+export function branchCiTrigger(branch: string, sha: string, revision: number, summary: string, url: string): Trigger {
+  return { id: key('gitcode-ci', `branch:${branch}`, String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: `ci:${branch}` }],
+    actor: { source: SOURCE, id: '' }, human: false, at: new Date().toISOString(), text: summary, url, meta: { ci: true, branch, sha, revision } }
 }
