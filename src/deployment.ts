@@ -47,14 +47,25 @@ export const GithubAccountsSchema = z.object({
   cli: z.string().trim().default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
+/** GitCode/AtomGit Source configuration: repository, the agent's CLI wrapper, the host, and an optional commit email. */
+export const GitcodeAccountsSchema = z.object({
+  repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
+  cli: z.string().trim().default(''),
+  host: z.string().trim().regex(/^[A-Za-z0-9.-]+$/, 'hostname').default('gitcode.com'),
+  commitEmail: z.string().trim().email().or(z.literal('')).default(''),
+  configDir: z.string().trim().default(''),
+})
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
-
-export interface Deployment extends Machine {
-  repository: string
-  github: { cli: string; login: string; noreply: string }
-  feishu?: FeishuBot
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape), gitcode: Object.keys(GitcodeAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape),
 }
+
+export interface GithubAccount { cli: string; login: string; noreply: string }
+export interface GitcodeAccount { cli: string; host: string; login: string; email: string; configDir: string }
+interface DeploymentBase extends Machine { repository: string; feishu?: FeishuBot }
+export interface GithubDeployment extends DeploymentBase { forge: 'github'; github: GithubAccount }
+export interface GitcodeDeployment extends DeploymentBase { forge: 'gitcode'; gitcode: GitcodeAccount }
+export type Deployment = GithubDeployment | GitcodeDeployment
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
@@ -84,7 +95,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveGithub(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<GithubDeployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -102,7 +113,71 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  return { ...machine, forge: 'github', repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+const GitcodeUser = z.looseObject({
+  login: z.string().min(1), id: z.union([z.string(), z.number()]).optional(), email: z.string().optional(),
+})
+const GitcodeRepository = z.looseObject({
+  full_name: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+})
+const GitcodePermission = z.looseObject({
+  role_info: z.looseObject({ access_level: z.number().optional() }).optional(),
+  resource_trees: z.array(z.looseObject({
+    scope: z.string().optional(),
+    actions: z.array(z.looseObject({ action: z.string().optional(), selected: z.boolean().optional() })).optional(),
+  })).optional(),
+})
+/** True when the role or the code-scope permissions allow pushing. GitCode uses access levels 30 developer, 40 maintainer, 50 owner. */
+export function gitcodeCanPush(permission: z.infer<typeof GitcodePermission>): boolean {
+  const level = permission.role_info?.access_level
+  if (typeof level === 'number' && level >= 30) return true
+  return !!permission.resource_trees?.some(tree => tree.scope === 'code' && tree.actions?.some(action => action.action === 'push' && action.selected === true))
+}
+/** Verify the agent's GitCode CLI identity and push access to the configured repository. */
+export async function resolveGitcode(machine: Machine, gitcode: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<GitcodeDeployment> {
+  const { stateDir } = machine
+  const accounts = GitcodeAccountsSchema.parse(gitcode ?? {})
+  const remote = accounts.repository
+  if (!remote) throw new SetupError('gitcodeRepositoryUnset')
+  if (!accounts.cli) throw new SetupError('gitcodeCliUnset')
+  let cli: string
+  try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('gitcodeCliMissing', { output: reason(error) }) }
+  const run = (...args: string[]): Promise<string> => probe([cli, '--no-interactive', '--no-update-check', 'api', ...args])
+  const text = await run('user').catch((error: unknown) => { throw new SetupError('gitcodeCliSignedOut', { output: reason(error) }) })
+  const agent = parsed(GitcodeUser, text)
+  if (!agent) throw new SetupError('gitcodeCliNoAccount')
+  const repo = parsed(GitcodeRepository, await run(`repos/${remote}`).catch((error: unknown) => {
+    throw new SetupError('gitcodeRepositoryUnreadable', { account: agent.login, repository: remote, output: reason(error) })
+  }))
+  if (!repo) throw new SetupError('gitcodeRepositoryUnreported', { repository: remote })
+  const permission = parsed(GitcodePermission, await run(`repos/${repo.full_name}/collaborators/self-permission`).catch((error: unknown) => {
+    throw new SetupError('gitcodeRepositoryUnreadable', { account: agent.login, repository: repo.full_name, output: reason(error) })
+  }))
+  if (!permission) throw new SetupError('gitcodeRepositoryUnreported', { repository: repo.full_name })
+  if (!gitcodeCanPush(permission)) throw new SetupError('gitcodeRepositoryReadOnly', { account: agent.login, repository: repo.full_name })
+  const email = accounts.commitEmail || agent.email || ''
+  if (!email) throw new SetupError('gitcodeEmailUnset')
+  const configDir = accounts.configDir ? (isAbsolute(accounts.configDir) ? accounts.configDir : join(stateDir, accounts.configDir)) : join(stateDir, 'gc-agent')
+  return { ...machine, forge: 'gitcode', repository: repo.full_name, gitcode: { cli, host: accounts.host, login: agent.login, email, configDir } }
+}
+
+/** The Source configuration blocks setup reads to choose the deployment's forge. */
+export interface ForgeAccounts { github?: unknown; gitcode?: unknown }
+/**
+ * Choose the deployment's forge: GitHub when its repository or CLI is configured, GitCode when its is, and reject both.
+ * With neither configured, the GitHub checks run and report the existing `repositoryUnset` problem.
+ */
+export async function resolveDeployment(machine: Machine, accounts: ForgeAccounts, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  // Accept a bare GitHub block for callers that predate the forge choice.
+  const raw = accounts && typeof accounts === 'object' && ('github' in accounts || 'gitcode' in accounts) ? accounts : { github: accounts }
+  const github = GithubAccountsSchema.parse(raw.github ?? {})
+  const gitcode = GitcodeAccountsSchema.parse(raw.gitcode ?? {})
+  const useGithub = !!github.repository || !!github.cli
+  const useGitcode = !!gitcode.repository || !!gitcode.cli
+  if (useGithub && useGitcode) throw new SetupError('forgeAmbiguous')
+  return useGitcode ? resolveGitcode(machine, raw.gitcode, probe, path) : resolveGithub(machine, raw.github, probe, path)
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

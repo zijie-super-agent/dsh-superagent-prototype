@@ -1,7 +1,7 @@
 /** SourceKind plugin contract: configuration schema, UI form fields, policy integration, channel adapter, and thread context reader. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { z } from 'zod'
-import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
+import type { OutboundMessage, ScopeResult, Ticket, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { SourceContext, SourceHost } from './host.ts'
@@ -108,8 +108,32 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   policy?: SourcePolicyPart<Record<string, unknown> & { allowed: { id: string; name?: string }[] }>
   /** Rereads display names for row keys (such as chat names), stores the resolved names in `KV.sources.labels(kind)`, and returns them. */
   refreshLabels?(host: SourceHost, signal?: AbortSignal): Promise<Record<string, string>>
+  /** Optional pull request binding for Sources whose Tickets follow pull requests. */
+  pull?: PullBinding
   /** Variables the kind registers with the execution environment and how their values are computed. */
   environment?: { variables: readonly VariableSpec[]; values(input: EnvironmentInput<C>): Record<string, string> }
+}
+
+/** A pull request as a Source's binding sees it; Source-specific fields stay in the adapter. */
+export interface PullInfo {
+  number: number
+  state: string
+  merged?: boolean | null
+  mergedAt?: string | null
+  closedAt?: string | null
+  title?: string
+  url?: string
+  autoMerge?: unknown
+  user: { login: string }
+  head: { ref: string; sha?: string; repo?: { full_name?: string } | null }
+}
+/** A Source's pull request binding: read, claim and observe PRs, list those a Ticket follows, and build its end notices. */
+export interface PullBinding {
+  read(commands: Commands, number: number, signal?: AbortSignal): Promise<PullInfo>
+  claim(ctx: SourceContext, ticketId: string, pull: PullInfo): string | undefined
+  observe(ctx: SourceContext, pull: PullInfo): Promise<boolean>
+  numbers(ticket: Pick<Ticket, 'follows'>, open?: boolean): number[]
+  notice(ticket: Ticket, request: string, deployment: Deployment): OutboundMessage[]
 }
 
 export interface SourceInstance<C extends Record<string, unknown> = Record<string, unknown>> { id: string; kind: string; enabled: boolean; config: C }
